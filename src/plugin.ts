@@ -114,14 +114,6 @@ function installPromptGuard(client: unknown, matcher: PromptGuardMatcher): void 
     session[PROMPT_GUARD_INSTALLED_KEY] = true;
 }
 
-function isMessageAbortedError(error: unknown): boolean {
-    if (!error || typeof error !== "object") {
-        return false;
-    }
-    const maybeError = error as { name?: unknown };
-    return maybeError.name === "MessageAbortedError";
-}
-
 // True for ANY assistant-message error, not just user-initiated aborts.
 // opencode's processor.halt() sets assistantMessage.error identically for a
 // deny-rule tool-permission block (Effect.orDie -> defect -> halt, verified
@@ -166,6 +158,16 @@ function log(...args: unknown[]): void {
 
 export const TodoReminderPlugin: Plugin = async ({ client, directory }) => {
     const config = loadConfig(directory);
+    // Shared with the main reminder check (line ~347's validStatuses) so
+    // guardTodoWrite and getOrphanedTodoTable agree with what actually
+    // triggers a reminder - previously both hardcoded pending/in_progress
+    // only, missing "open" (in the DEFAULT triggerStatuses) and any custom
+    // status a user configures, so a genuinely open todo could still be
+    // silently dropped by the exact guard meant to protect it.
+    const unfinishedStatuses = new Set(config.triggerStatuses);
+    function isUnfinishedStatus(status: string): boolean {
+        return unfinishedStatuses.has(status);
+    }
     setupDebug(directory, config.debug);
 
     log("=== PLUGIN START ===", { config });
@@ -289,9 +291,7 @@ export const TodoReminderPlugin: Plugin = async ({ client, directory }) => {
             try {
                 const resp = await client.session.todo({ path: { id: candidate.id } });
                 const todos = Array.isArray(resp.data) ? resp.data : [];
-                const openCount = todos.filter(
-                    (t) => t.status === "pending" || t.status === "in_progress",
-                ).length;
+                const openCount = todos.filter((t) => isUnfinishedStatus(t.status)).length;
                 if (openCount > 0) {
                     openCounts.set(candidate.id, openCount);
                 }
@@ -467,8 +467,8 @@ export const TodoReminderPlugin: Plugin = async ({ client, directory }) => {
             const promptError = (promptResponse as {
                 data?: { info?: { error?: unknown } };
             }).data?.info?.error;
-            if (isMessageAbortedError(promptError)) {
-                log("PROMPT RESULT ABORTED", { sessionID });
+            if (hasAssistantMessageError(promptError)) {
+                log("PROMPT RESULT ERRORED", { sessionID });
                 await pauseSessionAfterAbort(sessionID, "prompt-response");
                 return;
             }
@@ -521,17 +521,33 @@ export const TodoReminderPlugin: Plugin = async ({ client, directory }) => {
             return;
         }
 
-        const proposedContents = new Set(
-            proposed
-                .map((t) => (t && typeof t === "object" ? (t as { content?: unknown }).content : undefined))
-                .filter((c): c is string => typeof c === "string"),
-        );
+        // Count occurrences rather than a Set, so two unfinished todos that
+        // happen to share identical content are each tracked separately -
+        // a Set collapsed duplicates, meaning if the model's new list kept
+        // only one of two identically-worded unfinished todos, the OTHER
+        // was treated as "already present" and silently dropped anyway.
+        const proposedContentCounts = new Map<string, number>();
+        for (const t of proposed) {
+            const content = t && typeof t === "object" ? (t as { content?: unknown }).content : undefined;
+            if (typeof content === "string") {
+                proposedContentCounts.set(content, (proposedContentCounts.get(content) ?? 0) + 1);
+            }
+        }
 
-        const dropped = current.filter(
-            (t) =>
-                (t.status === "pending" || t.status === "in_progress") &&
-                !proposedContents.has(t.content),
-        );
+        const dropped: Array<{ content: string; status: string; priority: string }> = [];
+        for (const t of current) {
+            if (!isUnfinishedStatus(t.status)) continue;
+            const remaining = proposedContentCounts.get(t.content) ?? 0;
+            if (remaining > 0) {
+                proposedContentCounts.set(t.content, remaining - 1);
+                continue; // this occurrence is accounted for in the new list
+            }
+            // Project to exactly the tool's declared input shape
+            // (content/status/priority) - current comes from
+            // client.session.todo() and may carry extra fields (e.g. id)
+            // that the todowrite tool's own input schema doesn't expect.
+            dropped.push({ content: t.content, status: t.status, priority: t.priority });
+        }
 
         if (dropped.length === 0) return;
 

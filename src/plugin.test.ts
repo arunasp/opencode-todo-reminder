@@ -914,6 +914,60 @@ describe("TodoReminderPlugin", () => {
             expect(mockClient.session.prompt).toHaveBeenCalledTimes(2);
         });
 
+        it("should pause after an injected prompt errors with something other than MessageAbortedError", async () => {
+            // The prompt-response check was the one site the "any
+            // assistant-message error" generalization missed - it still
+            // only recognized MessageAbortedError, so a different error on
+            // the reminder's OWN injected prompt (e.g. the same
+            // permission-deny-halt pattern that motivated generalizing the
+            // other two sites) was treated as a normal send and the loop
+            // counter was incremented instead of pausing.
+            mockConfig = createConfig({ idleDelayMs: 1000, useToasts: false });
+            const hooks = await createPlugin();
+
+            await hooks.event?.({
+                event: {
+                    type: "todo.updated",
+                    properties: {
+                        sessionID: "session-other-error",
+                        todos: [createTodo({ status: "pending" })],
+                    },
+                } as any,
+            });
+
+            mockClient.session.todo.mockResolvedValue({
+                data: [createTodo({ status: "pending" })],
+            });
+            mockClient.session.prompt.mockResolvedValue({
+                data: {
+                    info: {
+                        error: { name: "UnknownError" },
+                    },
+                },
+            });
+
+            await hooks.event?.({
+                event: {
+                    type: "session.idle",
+                    properties: { sessionID: "session-other-error" },
+                } as any,
+            });
+
+            await vi.advanceTimersByTimeAsync(1500);
+            expect(mockClient.session.prompt).toHaveBeenCalledTimes(1);
+
+            // Session should remain paused on a further idle, same as the
+            // MessageAbortedError case - not incrementing the loop counter.
+            await hooks.event?.({
+                event: {
+                    type: "session.idle",
+                    properties: { sessionID: "session-other-error" },
+                } as any,
+            });
+            await vi.advanceTimersByTimeAsync(1500);
+            expect(mockClient.session.prompt).toHaveBeenCalledTimes(1);
+        });
+
         it("should block reminder-like prompt injections from other plugin instances while paused", async () => {
             mockConfig = createConfig({
                 useToasts: false,
@@ -1331,6 +1385,89 @@ describe("TodoReminderPlugin", () => {
             expect(output.args.todos).toEqual([
                 { content: "Task A", status: "completed", priority: "medium" },
             ]);
+        });
+
+        it("should backfill an omitted todo whose status is 'open' (not just pending/in_progress)", async () => {
+            // Default triggerStatuses includes "open"; the guard previously
+            // hardcoded only pending/in_progress, so an open todo dropped by
+            // the model was NOT protected by the exact feature meant to
+            // protect it.
+            const hooks = await createPlugin();
+
+            mockClient.session.todo.mockResolvedValue({
+                data: [createTodo({ content: "Task open", status: "open" })],
+            });
+
+            const output = { args: { todos: [] } };
+
+            await hooks["tool.execute.before"]?.(
+                { tool: "todowrite", sessionID: "session-x", callID: "call-1" },
+                output,
+            );
+
+            expect(output.args.todos).toEqual([
+                { content: "Task open", status: "open", priority: "medium" },
+            ]);
+        });
+
+        it("should preserve each occurrence when two unfinished todos share identical content", async () => {
+            // A Set-based "already present" check collapses duplicate
+            // content strings - if the model's new list kept only ONE of
+            // two identically-worded unfinished todos, the check reported
+            // both as "present" and the second was silently dropped anyway.
+            const hooks = await createPlugin();
+
+            mockClient.session.todo.mockResolvedValue({
+                data: [
+                    createTodo({ id: "t1", content: "Duplicate task", status: "pending" }),
+                    createTodo({ id: "t2", content: "Duplicate task", status: "in_progress" }),
+                ],
+            });
+
+            const output = {
+                args: {
+                    todos: [{ content: "Duplicate task", status: "pending", priority: "medium" }],
+                },
+            };
+
+            await hooks["tool.execute.before"]?.(
+                { tool: "todowrite", sessionID: "session-x", callID: "call-1" },
+                output,
+            );
+
+            // One occurrence was already in the model's new list (claimed);
+            // the second occurrence must still be backfilled, not eaten.
+            expect(output.args.todos).toHaveLength(2);
+            expect(
+                output.args.todos.filter((t: { content: string }) => t.content === "Duplicate task"),
+            ).toHaveLength(2);
+        });
+
+        it("should project backfilled todos to exactly content/status/priority, dropping extra fields like id", async () => {
+            const hooks = await createPlugin();
+
+            mockClient.session.todo.mockResolvedValue({
+                data: [
+                    createTodo({
+                        id: "db-generated-id-123",
+                        content: "Task with id",
+                        status: "pending",
+                        priority: "high",
+                    }),
+                ],
+            });
+
+            const output = { args: { todos: [] } };
+
+            await hooks["tool.execute.before"]?.(
+                { tool: "todowrite", sessionID: "session-x", callID: "call-1" },
+                output,
+            );
+
+            expect(output.args.todos).toEqual([
+                { content: "Task with id", status: "pending", priority: "high" },
+            ]);
+            expect(output.args.todos[0]).not.toHaveProperty("id");
         });
     });
 

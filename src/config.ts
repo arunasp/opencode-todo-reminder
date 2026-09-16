@@ -95,20 +95,26 @@ export const TodoReminderConfigSchema = z.object({
 
     /**
      * Whether to check for incomplete todos left behind in OTHER sessions
-     * in this project when the CURRENT session has none of its own.
-     * Session IDs change on every new/resumed/compacted session, and
-     * opencode's todo table is keyed by session_id with no cross-session
-     * carryover (verified: session table has project_id/parent_id, but
-     * SessionTodo has no linkage of its own) - so a session's incomplete
-     * todos, once that session ends, just sit in the DB forever unless
-     * something specifically goes looking across sessions. Off by default:
-     * this does extra API calls (session.list + one todo fetch per
-     * candidate session) that the other fixes in this plugin don't need,
-     * and surfaces information about possibly-abandoned/no-longer-relevant
-     * old work, which can be noise as easily as it can be useful. When
-     * enabled, this only shows a toast (does not inject anything into the
-     * model's context) - old sessions' tasks are not this session's plan,
-     * and should not be silently presented to the model as if they were.
+     * in this project. Session IDs change on every new/resumed/compacted
+     * session, and opencode's todo table is keyed by session_id with no
+     * cross-session carryover (verified: session table has
+     * project_id/parent_id, but SessionTodo has no linkage of its own) -
+     * so a session's incomplete todos, once that session ends, just sit in
+     * the DB forever unless something specifically goes looking across
+     * sessions. Off by default: this does extra API calls (session.list +
+     * one todo fetch per candidate session) that the other fixes in this
+     * plugin don't need, and surfaces information about
+     * possibly-abandoned/no-longer-relevant old work, which can be noise as
+     * easily as it can be useful. When enabled, a found summary is
+     * interpolated into the periodic reminder text itself via the
+     * {orphan_table} placeholder in messageFormat/inProgressMessageFormat -
+     * it only ever rides along on a reminder THIS session was already
+     * about to send (there must be pending/in_progress/etc. todos of its
+     * own, per triggerStatuses); it is never sent as a standalone message,
+     * and a session with none of its own open todos does not trigger a
+     * scan on its own. Another session's leftover plan is still not this
+     * session's plan - it is surfaced as a side note in an existing
+     * message, not presented as part of the current task list.
      * @default false
      */
     warnOrphanedTodos: z.boolean().optional().default(false),
@@ -119,7 +125,7 @@ export const TodoReminderConfigSchema = z.object({
      * API cost when a project has accumulated many past sessions.
      * @default 20
      */
-    orphanScanLimit: z.number().optional().default(20),
+    orphanScanLimit: z.number().int().nonnegative().optional().default(20),
 
     /**
      * Whether the injected prompt is synthetic (hidden from user)
